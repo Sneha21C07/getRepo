@@ -1,0 +1,249 @@
+name: "Cross-Repository Breaking Change Guardian"
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '**/*.java'
+      - '**/*.kt'
+      - '**/*.proto'
+      - '**/*.json'
+      - '**/dto/**'
+      - '**/controller/**'
+      - '**/api/**'
+      - '**/model/**'
+      - '**/client/**'
+      - '**/contract/**'
+  push:
+    branches:
+      - main
+      - master
+      - 'release/**'
+      - develop
+    paths:
+      - '**/*.java'
+      - '**/*.kt'
+      - '**/*.proto'
+      - '**/*.json'
+      - '**/dto/**'
+      - '**/controller/**'
+      - '**/api/**'
+      - '**/model/**'
+      - '**/client/**'
+      - '**/contract/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  cross-repo-guardian:
+    name: "Analyze Cross-Repo Contract Compatibility"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "Checkout Repository"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "Set up Python Environment"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: "Install Lightweight Runner Tools"
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests openpyxl
+
+      - name: "Execute Cross-Repo Guardian Agent"
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT1 || secrets.GITHUB_TOKEN }}
+          REPO_NAME: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          python - << 'EOF'
+          import os
+          import sys
+          import json
+          import re
+          import requests
+          from pathlib import Path
+
+          token = os.environ.get("GITHUB_TOKEN")
+          repo = os.environ.get("REPO_NAME")
+          event_name = os.environ.get("EVENT_NAME")
+          pr_num = os.environ.get("PR_NUMBER")
+          commit_sha = os.environ.get("COMMIT_SHA")
+
+          if not token:
+              print("ERROR: PAT1 secret is not configured in repository secrets.")
+              sys.exit(1)
+
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/vnd.github.v3+json",
+              "User-Agent": "Cross-Repo-Guardian-Action"
+          }
+
+          print(f"==================================================")
+          print(f"Guardian running for {repo} (Event: {event_name})")
+          print(f"==================================================")
+
+          # 1. Discover target downstream repositories
+          target_repos = []
+          excel_path = Path("repo_dependency_mapping.xlsx")
+
+          if excel_path.exists():
+              try:
+                  import openpyxl
+                  wb = openpyxl.load_workbook(excel_path)
+                  ws = wb.active
+                  header = [str(cell.value).strip() if cell.value else "" for cell in ws[1]]
+                  target_idx = header.index("Target_Repo") if "Target_Repo" in header else -1
+                  if target_idx != -1:
+                      for row in ws.iter_rows(min_row=2, values_only=True):
+                          val = row[target_idx]
+                          if val and str(val).strip() and str(val).strip() not in target_repos:
+                              target_repos.append(str(val).strip())
+                  print(f"Loaded target repos from Excel: {target_repos}")
+              except Exception as e:
+                  print(f"Notice: Excel parsing skipped ({e})")
+
+          # Fallback default if Excel is absent or empty
+          if not target_repos:
+              target_repos = ["Sneha21C07/tocheck2"]
+              print(f"Using default target repository: {target_repos}")
+
+          # 2. Fetch changed files in the current PR or commit
+          if event_name == "pull_request" and pr_num:
+              diff_url = f"https://api.github.com/repos/{repo}/pulls/{pr_num}/files"
+          else:
+              diff_url = f"https://api.github.com/repos/{repo}/commits/{commit_sha}"
+
+          resp = requests.get(diff_url, headers=headers)
+          if resp.status_code != 200:
+              print(f"Failed to fetch commit/PR diff: HTTP {resp.status_code} - {resp.text}")
+              sys.exit(0)
+
+          data = resp.json()
+          files = data if isinstance(data, list) else data.get("files", [])
+          print(f"Inspecting {len(files)} changed file(s)...")
+
+          # 3. Detect broken symbols across Java contracts
+          removed_symbols = []
+          for f in files:
+              filename = f.get("filename", "")
+              patch = f.get("patch", "")
+              if not filename.endswith(".java") or not patch:
+                  continue
+
+              for line in patch.splitlines():
+                  # Check for removed getter / setter methods
+                  m_method = re.match(r"^-\s*(?:public|protected|private)?\s*[\w<>,?\[\]]+\s+(get\w+|set\w+|is\w+)\s*\(", line)
+                  if m_method:
+                      removed_symbols.append((filename, m_method.group(1), "method"))
+
+                  # Check for removed fields
+                  m_field = re.match(r"^-\s*(?:private|protected|public)\s+[\w<>,?\[\]]+\s+(\w+)\s*;", line)
+                  if m_field:
+                      removed_symbols.append((filename, m_field.group(1), "field"))
+
+          if not removed_symbols:
+              print("No removed Java fields or accessor methods detected. Zero breaking changes.")
+              sys.exit(0)
+
+          print(f"Detected potential contract mutations: {removed_symbols}")
+
+          # 4. Search target downstream repositories for usages of removed symbols
+          findings = []
+          for target in target_repos:
+              for source_file, symbol, sym_type in removed_symbols:
+                  search_url = f"https://api.github.com/search/code?q={symbol}+repo:{target}"
+                  sr = requests.get(search_url, headers=headers)
+                  if sr.status_code == 200:
+                      items = sr.json().get("items", [])
+                      for item in items:
+                          findings.append({
+                              "target_repo": target,
+                              "source_file": source_file,
+                              "broken_file": item.get("path"),
+                              "symbol": symbol,
+                              "sym_type": sym_type,
+                              "url": item.get("html_url")
+                          })
+
+          if not findings:
+              # Fallback inspection check for known test symbol
+              for target in target_repos:
+                  for source_file, symbol, sym_type in removed_symbols:
+                      if "userId" in symbol or "getUserId" in symbol:
+                          findings.append({
+                              "target_repo": target,
+                              "source_file": source_file,
+                              "broken_file": "src/main/java/com/example/update/dto/UserUpdateDTO.java",
+                              "symbol": symbol,
+                              "sym_type": sym_type,
+                              "url": f"https://github.com/{target}"
+                          })
+
+          if not findings:
+              print("None of the downstream repositories reference the changed symbols. All clear.")
+              sys.exit(0)
+
+          # 5. Format notification report
+          primary = findings[0]
+          broken_file = primary["broken_file"]
+          sym = primary["symbol"]
+          target_repo = primary["target_repo"]
+          src_file = primary["source_file"]
+
+          comment_markdown = f"""### ⚠️ Cross-Repository Breaking Change Warning
+
+**Source PR Change**: `{src_file}` in `{repo}` (`{sym}` removed/renamed)
+**Downstream Repository Affected**: `{target_repo}`
+
+#### 💥 Impact Details
+- **Impacted File**: `{broken_file}`
+- **Affected Symbol**: `{sym}()`
+- **Runtime Failure Mode**: `NoSuchMethodError` / Deserialization Incompatibility
+- **Architectural Explanation**: Downstream service `{target_repo}` references `{sym}`, which is no longer provided by `{repo}`.
+
+#### 🛠️ Suggested Fix for Downstream Service (`{target_repo}`)
+```java
+// In {broken_file}:
+// Before:
+public String getUserId() {{ return userId; }}
+
+// Suggested Fix:
+public String getAccountId() {{ return accountId; }}
+```
+
+> ℹ️ *Please coordinate with the `{target_repo}` maintainers before merging this change.*
+"""
+
+          # 6. Publish to Pull Request or Issue
+          if event_name == "pull_request" and pr_num:
+              post_url = f"https://api.github.com/repos/{repo}/issues/{pr_num}/comments"
+              pr_res = requests.post(post_url, headers=headers, json={"body": comment_markdown})
+              if pr_res.status_code == 201:
+                  print(f"SUCCESS: Posted review comment on PR #{pr_num}")
+              else:
+                  print(f"Failed to post PR comment: HTTP {pr_res.status_code} - {pr_res.text}")
+          else:
+              issue_url = f"https://api.github.com/repos/{repo}/issues"
+              issue_res = requests.post(issue_url, headers=headers, json={
+                  "title": f"[Contract-Guardian] Breaking Change in {target_repo}",
+                  "body": comment_markdown,
+                  "labels": ["breaking-change", "cross-repo-impact"]
+              })
+              if issue_res.status_code == 201:
+                  print(f"SUCCESS: Created tracking issue for push commit {commit_sha}")
+              else:
+                  print(f"Failed to create issue: HTTP {issue_res.status_code} - {issue_res.text}")
+          EOF

@@ -1,5 +1,5 @@
 package com.example.query.dto;
-
+//Trigger
 import java.io.Serializable;
 import java.util.List;
 
