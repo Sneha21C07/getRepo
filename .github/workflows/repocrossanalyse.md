@@ -33,6 +33,7 @@ on:
       - '**/model/**'
       - '**/client/**'
       - '**/contract/**'
+  workflow_dispatch:
 
 permissions:
   contents: read
