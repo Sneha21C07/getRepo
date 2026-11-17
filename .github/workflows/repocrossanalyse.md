@@ -37,8 +37,8 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
-  issues: write
+  pull-requests: read
+  issues: read
 
 tools:
   github:

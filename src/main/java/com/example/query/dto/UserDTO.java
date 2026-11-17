@@ -1,6 +1,7 @@
 package com.example.query.dto;
 //Trigger
 //trigger1
+//trigger2
 import java.io.Serializable;
 import java.util.List;
 
